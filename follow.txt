@@ -1,0 +1,572 @@
+
+CRYPTO FUTURES MODEL — AGENT-READY TRAINING SPEC (STRICT KPI EDITION)
+=====================================================================
+
+This file supersedes prior spec. It encodes STRICT stop/return rules for the GPT Agent:
+• The agent must ONLY return “SUCCESS” (and stop) if ALL acceptance criteria are met.
+• Otherwise, keep iterating the training/thresholding/filters per the iteration ladder until success or
+  until a max-iteration guard is hit (then return a detailed FAILURE report).
+
+────────────────────────────────────────────────────────────────
+0) NORTH STAR & GUARDRAILS (updated targets)
+────────────────────────────────────────────────────────────────
+• KPI targets (must ALL hold on TEST folds):
+  - Monthly accuracy ≥ 70% for EVERY month in the test horizon.
+  - Overall rolling-12-month accuracy ≥ 60%.
+  - Trades ≥ 400 per year AND ≥ 20 per month (coverage constraint).
+  - Max consecutive losses < 5 (i.e., NEVER lose 5 in a row).
+  - Profit Factor ≥ 1.8; Max Drawdown within budget.
+• Decision rule: trade only if P(win) ≥ p* (tuned on validation per fold; see thresholding).
+• Position sizing: fixed risk R USD per trade (e.g., $10); qty so SL distance equals R.
+• Validation: purged, embargoed walk-forward only (no random k-fold on time).
+• Latency: features at bar t use info ≤ close[t]; HTF features must be LAGGED (completed bar).
+
+────────────────────────────────────────────────────────────────
+1) CONFIG (YAML the agent reads) — key diffs marked ★
+────────────────────────────────────────────────────────────────
+data:
+  symbol: "ETHUSDT"
+  venue: "binance"
+  tz: "UTC"
+  bar_seconds: 60
+  start: "2023-01-01"
+  end: "2025-08-01"
+  paths:
+    raw_dir: "data/raw"
+    cache_dir: "data/cache"
+    artifacts_dir: "artifacts"
+    reports_dir: "reports"
+
+labeling:
+  mode: "binance_long"
+  risk_usdt: 10.0
+  leverage: 55.0
+  taker_fee: 0.00045
+  maker_fee: 0.00018
+  entry_price: "next_close"
+  resolve_same_bar: "loss"
+  vertical: null
+  use_shorts: false
+
+features:
+  use_set: "lean_v1"
+  htf:
+    frames: ["5T", "15T"]
+    ema_windows: [20, 50, 200]
+  realized_vol_windows: [20, 60, 240]
+  atr_windows: [14, 28]
+
+splits:
+  train_months: 6
+  val_months: 1
+  test_months: 1
+  slide_by_months: 1
+  embargo_days: 3
+
+models:
+  baselines:
+    - "logreg_l2"
+    - "lightgbm"
+    - "xgboost"
+  params:
+    logreg_l2:
+      C: [0.1, 0.5, 1.0]
+    lightgbm:
+      num_leaves: [31, 63]
+      max_depth: [-1, 6, 8]
+      learning_rate: [0.05, 0.1]
+      n_estimators: 2000
+      subsample: 0.8
+      colsample_bytree: 0.8
+      class_weight: "balanced"
+      early_stopping_rounds: 200
+    xgboost:
+      max_depth: [5, 7]
+      eta: [0.05, 0.1]
+      n_estimators: 2000
+      subsample: 0.8
+      colsample_bytree: 0.8
+      reg_lambda: [1.0, 3.0]
+      scale_pos_weight: "auto"
+      early_stopping_rounds: 200
+
+thresholding:
+  p_star_init: 0.55
+  optimize_metric: "val_profit_factor"   # or val_f1, val_mcc
+  min_trades_year: 400     # ★ tighter (was 500 acceptable; now ≥400 is OK)
+  min_trades_month: 20     # ★ new monthly coverage constraint
+  enforce_no_5_losses: true  # ★ enforce via filter/cooldown in backtest
+
+filters:
+  atr_pct_max: 0.03
+  skip_on_regime_break: true
+  cooldown_after_losses: 4   # ★ after 4 consecutive losses, pause new entries N bars
+  cooldown_bars: 60          # ★ pause length (e.g., 60 minutes)
+
+backtest:
+  entry_latency_bars: 1
+  tp_r: 1.5
+  sl_r: 1.0
+  conservative_same_bar: true
+  enforce_sequence_rules: true  # ★ checks max consecutive losses < 5
+
+reports:
+  include: ["precision_coverage", "weekly", "rolling_3m", "confusion", "pf_dd_equity", "shap_topk", "monthly_kpis"]
+
+agent_control:
+  require_success_before_return: true  # ★ only return SUCCESS if all KPIs met
+  max_iterations: 25                   # safety to prevent infinite loops
+  iteration_ladder: ["threshold", "filters", "feature_trim", "class_weight", "label_tweak", "meta_label", "regime_split"]
+
+────────────────────────────────────────────────────────────────
+2) TASK GRAPH — same order, with new gates
+────────────────────────────────────────────────────────────────
+1. data_io.validate_repair
+2. resample_htf_safely
+3. features.make_features (lean_v1)
+4. labeling (Binance-accurate long)
+5. splits.make_walkforward_splits (purged + embargo)
+6. trainers.fit_and_select (with early stopping)
+7. threshold.optimize (respect min_trades_year/month; build precision–coverage)
+8. backtest.simulate (apply cooldown-after-4-losses; enforce sequence rule)
+9. diagnostics (shuffle, permutation, stability, regime analysis)
+10. reports.export
+11. gatekeeper.check_and_iterate  ★
+    - If ANY KPI fails → iterate via agent_control.iteration_ladder and go back to step 6.
+    - If ALL pass → return SUCCESS with artifacts.
+
+────────────────────────────────────────────────────────────────
+3) ACCEPTANCE CRITERIA (HARD; ALL MUST PASS)
+────────────────────────────────────────────────────────────────
+• Accuracy:
+  - EVERY calendar month in the test horizon: accuracy ≥ 70%  ★
+  - Rolling 12-month overall accuracy ≥ 60%                    ★
+• Coverage:
+  - Trades ≥ 400 per year                                      ★
+  - Trades ≥ 20 per month                                      ★
+• Risk:
+  - Max consecutive losses < 5 (i.e., never 5 losses in a row) ★
+  - Profit Factor ≥ 1.8; Max DD within budget
+• Hygiene:
+  - No leakage (HTF lag OK; shuffle test collapses to chance)
+• Artifacts & Reports saved.
+
+────────────────────────────────────────────────────────────────
+4) GATEKEEPER & ITERATION LOGIC (how the agent “keeps trying”)
+────────────────────────────────────────────────────────────────
+On KPI failure, iterate through these knobs (in order) and re-run steps 6–10:
+1) threshold: sweep p* wider; prefer higher precision while maintaining min monthly trades.
+2) filters: adjust atr_pct_max; enable/extend cooldown_bars; add time-of-day exclusions if needed.
+3) feature_trim: drop low-stability features (by permutation/stability) to reduce overfit.
+4) class_weight: re-tune scale_pos_weight / class_weight to shift precision-recall.
+5) label_tweak: require tiny pre-move filter for labels to reduce noise; optional soft vertical barrier (e.g., 4h).
+6) meta_label: train a meta-model to accept/reject primary signals (boost precision without killing coverage).
+7) regime_split: train separate models for low-vol vs high-vol regimes with a simple vol switch.
+
+Stop if all KPIs pass (SUCCESS) or max_iterations is reached (FAILURE with diagnostic report).
+
+────────────────────────────────────────────────────────────────
+5) CODE SNIPPETS TO ENFORCE NEW RULES
+────────────────────────────────────────────────────────────────
+Example placeholder interfaces (implement in your agent runtime):
+
+def enforce_trade_coverage(monthly_counts, min_trades_month=20, min_trades_year=400) -> bool:
+    # Return True only if every month has >= min_trades_month AND the annual sum >= min_trades_year.
+    ...
+
+def compute_consecutive_losses(trades_ledger) -> int:
+    # Return the maximum number of consecutive losing trades in the ledger.
+    ...
+
+def apply_cooldown(signals, trades_ledger, cooldown_after_losses=4, cooldown_bars=60):
+    # If the last `cooldown_after_losses` closed trades are all losses, suppress new entries for
+    # `cooldown_bars` bars (or until a win). Implement by zeroing signals during cooldown windows.
+    ...
+
+# Backtest post-check (pseudo):
+# max_consec_losses = compute_consecutive_losses(ledger)
+# assert max_consec_losses < 5, "Sequence rule violated: 5 consecutive losses occurred"
+
+# Threshold sweep rule (pseudo):
+# For each candidate p*:
+#   - Simulate validation backtest with cooldown & filters.
+#   - Reject p* if any month < 70% accuracy or monthly trades < 20.
+#   - Keep best p* by optimize_metric subject to constraints.
+
+# Reports: include a monthly KPIs table (acc%, trades, PF, DD, max_consec_losses).
+
+────────────────────────────────────────────────────────────────
+6) EVERYTHING ELSE (same as prior spec)
+────────────────────────────────────────────────────────────────
+• Data validation & repair
+• Binance-accurate labeling (Q, N, MMR, P_liq, P_tp, forward scan, conservative same-bar resolution)
+• Features (lean_v1; no leak)
+• Purged + embargoed walk-forward splits
+• Models (LogReg, LightGBM, XGBoost) with early stopping & class weights
+• Diagnostics (shuffle, permutation, stability, regime analysis)
+• Reports (precision_coverage, confusion/F1/MCC, weekly, rolling_3m, PF/DD/equity, SHAP, monthly_kpis)
+
+────────────────────────────────────────────────────────────────
+7) REMINDERS
+────────────────────────────────────────────────────────────────
+• The agent must NOT claim success until all KPIs pass.
+• If using shorts later, apply the same KPI constraints per month and for combined book.
+• Keep all latency/lag rules intact to avoid hidden look-ahead.
+• Use the same fee/MMR logic in labeling and in backtest to keep parity with live.
+4) ALGORITHMS (FIRST, NO CODE)
+────────────────────────────────────────────────────────────────
+
+A) Data Validation & Repair (1-minute OHLCV, UTC)
+-------------------------------------------------
+INPUT: df[timestamp, open, high, low, close, volume, ...], bar_seconds=60
+STEPS:
+1) Sort by timestamp, drop duplicates (keep first), snap to exact minute boundaries (UTC).
+2) Build expected minute index from min(ts) to max(ts); reindex.
+3) Detect missing runs:
+   • If gap length ≤ 2 bars: forward-fill: set open=high=low=close=prev_close; volume=0; flag repaired_small_gap=1.
+   • If gap length > 2 bars: DO NOT fill. Mark regime_break=1 on the first 3×gap real bars after the gap.
+4) Drop any remaining NaN rows (unrepaired gaps).
+5) Persist flags: repaired_small_gap, regime_break, dupe_flag, out_of_order_flag.
+
+B) Binance-Accurate TP/SL/Liquidation (Long)
+--------------------------------------------
+INPUTS (per candidate at time t):
+- Entry price E (execute at next bar: next_close or next_open)
+- Risk (isolated margin) M (e.g., 10 USDT) ⇒ SL equals −M at liquidation
+- Leverage L (e.g., 55)
+- Taker fee Ft=0.00045, Maker fee Fm=0.00018
+- Maintenance margin rate mmr (Binance tier; fallback 0.004)
+
+DERIVED:
+1) Qty: Q = (M·L)/E
+2) Notional: N = E·Q = M·L
+3) Maintenance margin: MM = N·mmr
+4) Liquidation price (long): P_liq = E + (MM − M + N·Ft) / Q
+5) PnL(Exit): PnL = Q·(Exit − E) − N·Ft·2   (taker both sides)
+6) Take-profit for +15 USDT net: P_tp = E + (15 + N·Ft·2) / Q
+
+LABELING (forward, no time limit; conservative on same-bar conflict):
+From entry forward:
+  if Low ≤ P_liq ⇒ loss (PnL = −M, y=−1)
+  else if High ≥ P_tp ⇒ win (PnL = +15, y=+1)
+  dataset end ⇒ loss.
+Same-bar conflict policy: loss | tp | skip (default: loss).
+
+C) Features (lean_v1; no leakage)
+---------------------------------
+• Price transforms: log returns 1m, 5m, 15m, 60m; rolling mean/vol/skew/kurt (20,60,240).
+• Volatility/range: ATR(14,28), TR%, Parkinson volatility.
+• Micro-structure: signed return streaks, roll-to-roll variance, gap% to HTF EMA.
+• HTF context (5m, 15m): EMA(20/50/200) of CLOSED HTF bars (lagged onto 1m); z-score distance to EMA200.
+• Regime flags: realized-vol z (20/60), weekend/holiday flag, regime_break.
+• Resampling hygiene: 1m→15m uses only the completed 15m candle for the next 15m window.
+
+D) Splits (Purged, Embargoed Walk-Forward)
+------------------------------------------
+• Train: 6 months → Val: 1 month → Test: 1 month; slide by 1 month.
+• Purge samples whose TP/SL windows cross boundaries.
+• Embargo 1–5 days after each boundary from training/validation when scoring test.
+
+E) Models, Thresholding, Backtest, Diagnostics (Overview)
+---------------------------------------------------------
+• Models: LogReg (L2), LightGBM/XGBoost (class weights, early stopping). Keep probability outputs.
+• Threshold p*: sweep on validation to build precision–coverage; choose p* by optimize_metric with min trade count.
+• Backtest: event-driven, entry at next bar; TP/SL by intra-bar H/L; conservative same-bar resolution.
+• Diagnostics: monthly label shuffle ⇒ accuracy collapses; permutation importance on test; stability of importances across folds;
+  regime analysis by vol buckets, HTF slope, time-of-day.
+
+────────────────────────────────────────────────────────────────
+5) CODE (AFTER ALGORITHMS) — READY TO PASTE
+────────────────────────────────────────────────────────────────
+
+# utils_time.py
+from datetime import timezone
+import pandas as pd
+
+def to_utc_floor_minute(ts: pd.Series) -> pd.Series:
+    s = pd.to_datetime(ts, utc=True).dt.floor("T")
+    return s
+
+def make_expected_index(ts: pd.Series, freq="T") -> pd.DatetimeIndex:
+    ts = pd.to_datetime(ts, utc=True)
+    return pd.date_range(ts.min(), ts.max(), freq=freq, tz=timezone.utc)
+
+
+# data_io.py
+import numpy as np
+import pandas as pd
+from utils_time import to_utc_floor_minute, make_expected_index
+
+def validate_repair(df: pd.DataFrame, bar_seconds: int = 60) -> pd.DataFrame:
+    """
+    Validate and lightly repair 1m OHLCV. Returns DataFrame with flags:
+      - repaired_small_gap (filled <=2 missing bars)
+      - regime_break (embargo after large gaps)
+      - dupe_flag, out_of_order_flag
+    Assumes columns: timestamp, open, high, low, close, volume
+    """
+    df = df.copy()
+
+    # order, dedupe, snap
+    df["timestamp"] = to_utc_floor_minute(df["timestamp"])
+    out_of_order_flag = int((df["timestamp"].diff().dropna() < pd.Timedelta(0)).any())
+    df = df.drop_duplicates(subset=["timestamp"], keep="first").sort_values("timestamp").reset_index(drop=True)
+    df["dupe_flag"] = 0
+
+    # expected index and reindex
+    exp_idx = make_expected_index(df["timestamp"], freq=f"{bar_seconds}s")
+    df = df.set_index("timestamp").reindex(exp_idx)
+    df.index.name = "timestamp"
+
+    # flags
+    df["repaired_small_gap"] = 0
+    df["regime_break"] = 0
+
+    # detect missing runs
+    missing_mask = df["close"].isna()
+    if missing_mask.any():
+        run_id = (missing_mask != missing_mask.shift()).cumsum()
+        for _, grp in df[missing_mask].groupby(run_id):
+            start = grp.index[0]
+            end = grp.index[-1]
+            gap_len = len(grp)
+
+            if gap_len <= 2:
+                prev_pos = df.index.get_loc(start) - 1
+                if prev_pos >= 0 and pd.notna(df.iloc[prev_pos]["close"]):
+                    prev_close = df.iloc[prev_pos]["close"]
+                    df.loc[start:end, ["open","high","low","close"]] = prev_close
+                    df.loc[start:end, "volume"] = 0.0
+                    df.loc[start:end, "repaired_small_gap"] = 1
+            else:
+                after_pos = df.index.get_loc(end) + 1
+                embargo_needed = 3 * gap_len
+                real_slice = df.iloc[after_pos:].loc[df["close"].iloc[after_pos:].notna()]
+                if len(real_slice):
+                    embargo_idx = real_slice.index[:embargo_needed]
+                    df.loc[embargo_idx, "regime_break"] = 1
+
+    df = df.dropna(subset=["open","high","low","close"]).copy()
+
+    df["out_of_order_flag"] = out_of_order_flag
+    for c in ["dupe_flag","repaired_small_gap","regime_break"]:
+        df[c] = df[c].astype(int)
+
+    return df.reset_index().rename(columns={"index":"timestamp"})
+
+
+# policy_sizing.py
+from dataclasses import dataclass
+
+@dataclass
+class FeeConfig:
+    taker: float = 0.00045  # Ft
+    maker: float = 0.00018  # Fm
+
+def qty_from_risk(entry_price: float, risk_usdt: float, leverage: float) -> float:
+    if entry_price <= 0 or risk_usdt <= 0 or leverage <= 0:
+        raise ValueError("entry_price, risk_usdt, leverage must be > 0")
+    return (risk_usdt * leverage) / entry_price
+
+def notional(entry_price: float, qty: float) -> float:
+    return entry_price * qty
+
+def default_mmr_from_notional(N: float) -> float:
+    return 0.004  # fallback; replace with Binance tiers if available
+
+def liquidation_price_long(
+    entry_price: float,
+    risk_usdt: float,
+    leverage: float,
+    fees: FeeConfig = FeeConfig(),
+    mmr_fn=default_mmr_from_notional,
+) -> tuple[float, float, float, float]:
+    """
+    Returns (P_liq, Q, N, MM) using:
+    Q = (M*L)/E, N = E*Q, MM = N*mmr, P_liq = E + (MM - M + N*Ft)/Q
+    """
+    E = float(entry_price)
+    M = float(risk_usdt)
+    L = float(leverage)
+    Ft = float(fees.taker)
+
+    Q = qty_from_risk(E, M, L)
+    N = notional(E, Q)
+    mmr = float(mmr_fn(N))
+    MM = N * mmr
+
+    P_liq = E + (MM - M + N * Ft) / Q
+    return P_liq, Q, N, MM
+
+def tp_price_for_target_pnl_long(
+    entry_price: float,
+    Q: float,
+    N: float,
+    target_pnl_usdt: float = 15.0,
+    fees: FeeConfig = FeeConfig(),
+    taker_both_sides: bool = True,
+) -> float:
+    E = float(entry_price)
+    Ft = float(fees.taker)
+    Fm = float(fees.maker)
+    fees_total = N * (Ft * 2.0 if taker_both_sides else Ft + Fm)
+    return E + (target_pnl_usdt + fees_total) / Q
+
+
+# labeling_binance.py
+import numpy as np
+import pandas as pd
+from policy_sizing import FeeConfig, liquidation_price_long, tp_price_for_target_pnl_long, default_mmr_from_notional
+
+def label_binance_long(
+    df: pd.DataFrame,
+    risk_usdt: float = 10.0,
+    leverage: float = 55.0,
+    fees: FeeConfig = FeeConfig(),
+    mmr_fn=None,
+    entry_price_mode: str = "next_close",   # 'next_close' | 'next_open'
+    resolve_same_bar: str = "loss",         # 'loss' | 'tp' | 'skip'
+) -> pd.DataFrame:
+    """
+    Labels y ∈ {-1, +1} via Binance-style liquidation (loss = -risk_usdt) and TP (+15 USDT net).
+    No time limit; dataset end => loss. Conservative on same-bar by default.
+    """
+    if mmr_fn is None:
+        mmr_fn = default_mmr_from_notional
+
+    arr_open  = df["open"].to_numpy()
+    arr_close = df["close"].to_numpy()
+    arr_high  = df["high"].to_numpy()
+    arr_low   = df["low"].to_numpy()
+    n = len(df)
+
+    # entry at next bar
+    if entry_price_mode == "next_close":
+        entry = np.roll(arr_close, -1)
+    elif entry_price_mode == "next_open":
+        entry = np.roll(arr_open, -1)
+    else:
+        raise ValueError("entry_price_mode must be 'next_close' or 'next_open'")
+    entry[-1] = np.nan
+
+    y = np.full(n, -1, dtype=int)   # default loss if neither hits
+    t_hit = np.full(n, -1, dtype=int)
+    qty = np.full(n, np.nan, dtype=float)
+    notional = np.full(n, np.nan, dtype=float)
+    mm = np.full(n, np.nan, dtype=float)
+    p_liq = np.full(n, np.nan, dtype=float)
+    p_tp  = np.full(n, np.nan, dtype=float)
+
+    for i in range(n - 1):
+        E = entry[i]
+        if not np.isfinite(E) or E <= 0:
+            continue
+
+        P_liq, Q, N, MM = liquidation_price_long(
+            entry_price=E,
+            risk_usdt=risk_usdt,
+            leverage=leverage,
+            fees=fees,
+            mmr_fn=mmr_fn,
+        )
+        P_tp = tp_price_for_target_pnl_long(
+            entry_price=E,
+            Q=Q,
+            N=N,
+            target_pnl_usdt=15.0,
+            fees=fees,
+            taker_both_sides=True,
+        )
+
+        qty[i] = Q
+        notional[i] = N
+        mm[i] = MM
+        p_liq[i] = P_liq
+        p_tp[i]  = P_tp
+
+        outcome = -1
+        hit = -1
+        for j in range(i + 1, n):
+            liq_hit = arr_low[j]  <= P_liq
+            tp_hit  = arr_high[j] >= P_tp
+
+            if liq_hit and tp_hit:
+                if resolve_same_bar == "loss":
+                    outcome, hit = -1, j
+                elif resolve_same_bar == "tp":
+                    outcome, hit = +1, j
+                else:  # 'skip' -> treat as no decision; keep default loss with no hit index
+                    outcome, hit = -1, -1
+                break
+
+            if liq_hit:
+                outcome, hit = -1, j
+                break
+            if tp_hit:
+                outcome, hit = +1, j
+                break
+
+        y[i] = outcome
+        t_hit[i] = hit
+
+    out = pd.DataFrame({
+        "timestamp": df["timestamp"].values,
+        "entry_px": entry,
+        "qty": qty,
+        "notional": notional,
+        "mm": mm,
+        "p_liq": p_liq,
+        "p_tp": p_tp,
+        "y": y,
+        "t_hit_idx": t_hit,
+    })
+    return out
+
+
+# (OPTIONAL) SHORT SIDE: formulas inverted (sketch)
+# Liquidation for short: P_liq_short = E - (MM - M + N*Ft)/Q
+# TP for +15 USDT (short): P_tp_short = E - (15 + N*Ft*2)/Q
+# Forward scan: if High ≥ P_liq_short -> loss; elif Low ≤ P_tp_short -> win.
+
+
+────────────────────────────────────────────────────────────────
+6) RUNBOOK (AGENT STEPS)
+────────────────────────────────────────────────────────────────
+1) Load config → seed everything.
+2) Load raw 1m OHLCV (UTC) from data.raw_dir.
+3) validate_repair → cache to data.cache_dir.
+4) resample_htf_safely → attach lagged HTF features (5m/15m EMAs).
+5) make_features (lean_v1) → cache.
+6) Compute ATR14/28 if needed; drop initial NaNs.
+7) label_binance_long → cache labels; (add shorts later if enabled).
+8) make_walkforward_splits (purge + embargo).
+9) For each fold:
+   - Train LogReg/LightGBM/XGBoost with class weights & early stopping.
+   - Threshold sweep on validation (precision–coverage) → choose p* by optimize_metric with min trades.
+   - Backtest on test using p*, filters; save ledger, equity, PF, DD.
+10) Aggregate metrics (12m; last-3m); diagnostics (shuffle, permutation, stability, regime analysis).
+11) Export reports; emit acceptance verdict; save artifacts.
+
+────────────────────────────────────────────────────────────────
+────────────────────────────────────────────────────────────────
+8) FEATURE SET REFERENCE (lean_v1)
+────────────────────────────────────────────────────────────────
+Returns: logret_1,5,15,60; rolling mean/vol/skew/kurt for windows 20,60,240.
+Volatility: ATR14, ATR28, TR%, Parkinson.
+Micro: streak_len (signed), r2r_var(20), gap_to_ema5m20, gap_to_ema15m50.
+HTF (lagged): ema5m(20/50/200), ema15m(20/50/200), zscore_dist_to_ema200 (5m/15m).
+Regime: rv_z20, rv_z60, weekend flag, regime_break.
+
+────────────────────────────────────────────────────────────────
+9) NOTES
+────────────────────────────────────────────────────────────────
+• Tiered maintenance margin (MMR): replace default 0.004 with a proper Binance tier function if you have it.
+• Fees: TP formula assumes taker on entry & exit. If you rest with maker on one side, change fees_total accordingly.
+• Same-bar ambiguity: conservative 'loss' is safer for backtests; you can switch to 'skip' to avoid undefined order.
+• Data age: Train on long history, validate walk-forward, weigh recent data if needed; retrain monthly.
+• Interpretability: later, add SHAP/feature importance in reports for trust and debugging.
+
+END OF FILE
+
+
+END OF STRICT KPI EDITION
